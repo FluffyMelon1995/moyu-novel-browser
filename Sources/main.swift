@@ -800,6 +800,10 @@ final class AutoBrowser {
     private var moveAnchor: (point: NSPoint, time: Date)?
     /// 真鼠标现在的位置（root 坐标），不在网页上时为 nil
     var mouseLocation: () -> NSPoint? = { nil }
+    /// 真鼠标是不是正停在这个窗口的网页上（没被别的窗口挡住，App 也在前台）
+    var pointerOverWebView: () -> Bool = { false }
+    private var realCursorHidden = false
+    private var cursorTimer: Timer?
 
     private var speed: Double { [1.7, 1.0, 0.6][min(2, max(0, Prefs.autoBrowseSpeed - 1))] }
     private var isTakenOver: Bool { Date() < takeoverUntil }
@@ -812,7 +816,9 @@ final class AutoBrowser {
         actionsSinceClick = 0
         takeoverUntil = .distantPast
         showCursor(at: mouseLocation() ?? randomPoint())
-        NSCursor.setHiddenUntilMouseMoves(true)   // 真光标先藏起来，免得屏幕上有两个箭头
+        // 真指针一直藏着（不是“动一下就出现”的那种），只有你接管、或者指针离开网页时才显示
+        cursorTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in self?.updateRealCursor() }
+        updateRealCursor()
         step()   // 一开启就马上动起来
     }
 
@@ -820,6 +826,20 @@ final class AutoBrowser {
         isRunning = false
         generation += 1
         cursor.isHidden = true
+        cursorTimer?.invalidate()
+        cursorTimer = nil
+        setRealCursorHidden(false)
+    }
+
+    private func updateRealCursor() {
+        setRealCursorHidden(isRunning && !isTakenOver && NSApp.isActive && pointerOverWebView())
+    }
+
+    /// NSCursor.hide / unhide 要成对调用，这里记着状态，保证不会多藏或多放
+    private func setRealCursorHidden(_ hidden: Bool) {
+        guard hidden != realCursorHidden else { return }
+        realCursorHidden = hidden
+        if hidden { NSCursor.hide() } else { NSCursor.unhide() }
     }
 
     /// 翻页之后的一小会儿不理会鼠标（宏鼠标按侧键翻页时手难免会带动鼠标）
@@ -843,7 +863,6 @@ final class AutoBrowser {
                 moveAnchor = (p, now)
             }
         }
-        NSCursor.setHiddenUntilMouseMoves(true)   // 没接管的话，把冒出来的真指针再藏回去
     }
 
     /// 真鼠标在网页上点击或滚动了：多让你一会儿
@@ -856,6 +875,7 @@ final class AutoBrowser {
         let wasTaken = isTakenOver
         takeoverUntil = max(takeoverUntil, Date().addingTimeInterval(seconds))
         cursor.isHidden = true
+        setRealCursorHidden(false)   // 交给你：真指针立刻出现
         guard !wasTaken else { return }
         generation += 1   // 取消假光标手上正在做的动作
         waitForHandBack()
@@ -868,7 +888,7 @@ final class AutoBrowser {
             guard let self, self.isRunning, self.generation == g else { return }
             if self.isTakenOver { return self.waitForHandBack() }
             self.showCursor(at: self.mouseLocation() ?? self.randomPoint())
-            NSCursor.setHiddenUntilMouseMoves(true)
+            self.updateRealCursor()
             self.schedule(after: 1.5)
         }
     }
@@ -885,10 +905,7 @@ final class AutoBrowser {
         let wv = webView()
         if isTakenOver { return }   // waitForHandBack 会接着来
         if wv.isLoading || wv.window == nil { return schedule(after: 1) }
-        if cursor.isHidden {
-            showCursor(at: mouseLocation() ?? randomPoint())
-            NSCursor.setHiddenUntilMouseMoves(true)
-        }
+        if cursor.isHidden { showCursor(at: mouseLocation() ?? randomPoint()) }
         actionsSinceClick += 1
         if Prefs.autoBrowseClicks, actionsSinceClick >= nextClickAfter {
             return clickStep()
@@ -1271,6 +1288,13 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
             guard let win = self.window else { return nil }
             let p = self.root.convert(win.mouseLocationOutsideOfEventStream, from: nil)
             return self.webView.frame.contains(p) ? p : nil
+        }
+        autoBrowser.pointerOverWebView = { [unowned self] in
+            guard let win = self.window, let p = self.autoBrowser.mouseLocation() else { return false }
+            // 在角落翻页按钮上时露出指针，方便瞄准
+            if (!self.prevZone.isHidden && self.prevZone.frame.contains(p)) || (!self.nextZone.isHidden && self.nextZone.frame.contains(p)) { return false }
+            // 指针所在位置最上面的窗口必须是这个窗口，不然就是被别的窗口挡住了
+            return NSWindow.windowNumber(at: NSEvent.mouseLocation, belowWindowWithWindowNumber: 0) == win.windowNumber
         }
     }
 
