@@ -646,7 +646,7 @@ final class AddressBox: NSView, NSTextFieldDelegate {
     }
 
     /// direction：0 不加动效，1 下一页，-1 上一页
-    func display(_ text: String, style: Style, direction: Int = 0) {
+    func display(_ text: String, style: Style, direction: Int = 0, highlight: NSRange? = nil) {
         if direction != 0, Prefs.pageTransition != 0, let layer = textView.layer {
             let t = CATransition()
             t.duration = Double(Prefs.transitionSpeed) / 100
@@ -660,7 +660,13 @@ final class AddressBox: NSView, NSTextFieldDelegate {
             }
             layer.add(t, forKey: "page")
         }
-        textView.textStorage?.setAttributedString(NSAttributedString(string: text, attributes: attributes(style)))
+        let s = NSMutableAttributedString(string: text, attributes: attributes(style))
+        // 搜索跳过来时，把关键词颜色加深一点、加条下划线，只有凑近才看得出来
+        if let h = highlight, h.location >= 0, NSMaxRange(h) <= s.length {
+            s.addAttributes([.foregroundColor: NSColor.labelColor, .underlineStyle: NSUnderlineStyle.single.rawValue,
+                             .underlineColor: NSColor.secondaryLabelColor], range: h)
+        }
+        textView.textStorage?.setAttributedString(s)
     }
 
     /// 从 from 开始，正好放满 lines 行的字符数
@@ -1068,6 +1074,180 @@ final class AutoBrowser {
     }
 }
 
+// MARK: - 小说全文搜索
+
+final class NovelSearchController: NSWindowController, NSSearchFieldDelegate, NSTableViewDataSource, NSTableViewDelegate {
+    struct Hit {
+        let offset: Int
+        let length: Int
+        let title: NSAttributedString
+    }
+
+    var novel: () -> Novel? = { nil }
+    var onJump: ((Hit) -> Void)?
+    private(set) var hits: [Hit] = []
+    private var current = -1
+    private var generation = 0
+    private let field = NSSearchField()
+    private let table = NSTableView()
+    private let status = NSTextField(labelWithString: "")
+    private static let maxHits = 1000
+
+    init() {
+        let win = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 480, height: 440),
+                          styleMask: [.titled, .closable, .resizable, .utilityWindow], backing: .buffered, defer: false)
+        win.title = "Find"
+        win.isFloatingPanel = true
+        win.hidesOnDeactivate = true   // 切到别的 App 就自动藏起来
+        win.minSize = NSSize(width: 360, height: 240)
+        super.init(window: win)
+
+        field.placeholderString = "搜索小说内容"
+        field.delegate = self
+        field.sendsWholeSearchString = true
+        field.target = self
+        field.action = #selector(searchSubmitted)
+
+        let col = NSTableColumn(identifier: .init("hit"))
+        col.resizingMask = .autoresizingMask
+        table.addTableColumn(col)
+        table.headerView = nil
+        table.rowHeight = 44
+        table.usesAlternatingRowBackgroundColors = true
+        table.dataSource = self
+        table.delegate = self
+        table.target = self
+        table.action = #selector(rowClicked)
+        let scroll = NSScrollView()
+        scroll.documentView = table
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+
+        status.textColor = .secondaryLabelColor
+        status.font = .systemFont(ofSize: 11)
+        status.stringValue = "回车或点结果跳过去；⌥⌘G 下一个，⇧⌥⌘G 上一个"
+
+        for v in [field, scroll, status] as [NSView] { v.translatesAutoresizingMaskIntoConstraints = false }
+        let content = NSView()
+        content.addSubview(field); content.addSubview(scroll); content.addSubview(status)
+        NSLayoutConstraint.activate([
+            field.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            field.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            field.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+            scroll.topAnchor.constraint(equalTo: field.bottomAnchor, constant: 10),
+            scroll.leadingAnchor.constraint(equalTo: field.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: field.trailingAnchor),
+            status.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 8),
+            status.leadingAnchor.constraint(equalTo: field.leadingAnchor),
+            status.trailingAnchor.constraint(equalTo: field.trailingAnchor),
+            status.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -10),
+        ])
+        win.contentView = content
+        win.center()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func show() {
+        showWindow(nil)
+        window?.makeKeyAndOrderFront(nil)
+        window?.makeFirstResponder(field)
+    }
+
+    /// 换了小说就清空结果
+    func reset() {
+        generation += 1
+        hits = []
+        current = -1
+        field.stringValue = ""
+        table.reloadData()
+    }
+
+    @objc private func searchSubmitted() {
+        let q = field.stringValue.trimmingCharacters(in: .whitespaces)
+        if q.isEmpty { return reset() }
+        search(q)
+    }
+
+    private func search(_ q: String) {
+        guard let n = novel() else {
+            status.stringValue = "还没有打开小说"
+            return
+        }
+        generation += 1
+        let g = generation
+        status.stringValue = "搜索中…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let text = n.text
+            var found: [Hit] = []
+            var range = NSRange(location: 0, length: text.length)
+            while found.count < Self.maxHits {
+                let r = text.range(of: q, options: [.caseInsensitive, .widthInsensitive], range: range)
+                if r.location == NSNotFound { break }
+                found.append(Hit(offset: r.location, length: r.length, title: Self.describe(r, in: n)))
+                let next = NSMaxRange(r)
+                range = NSRange(location: next, length: text.length - next)
+            }
+            DispatchQueue.main.async {
+                guard g == self.generation else { return }
+                self.hits = found
+                self.current = -1
+                self.table.reloadData()
+                self.status.stringValue = found.isEmpty ? "没有找到「\(q)」"
+                    : "找到 \(found.count == Self.maxHits ? "\(Self.maxHits)+" : "\(found.count)") 处 · 回车或点结果跳过去；⌥⌘G 下一个，⇧⌥⌘G 上一个"
+                if !found.isEmpty { self.go(to: 0) }
+            }
+        }
+    }
+
+    /// 结果的两行文字：章节名 · 百分比 / 前后文（关键词加粗）
+    private static func describe(_ r: NSRange, in n: Novel) -> NSAttributedString {
+        let chapter = n.chapterIndex(at: r.location).map { n.chapters[$0].title } ?? ""
+        let pct = Double(r.location) / Double(max(1, n.text.length)) * 100
+        let s = NSMutableAttributedString(string: String(format: "%@ · %.1f%%\n", chapter, pct),
+                                          attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])
+        let start = max(0, r.location - 24)
+        let end = min(n.text.length, NSMaxRange(r) + 40)
+        let before = n.text.substring(with: NSRange(location: start, length: r.location - start))
+        let match = n.text.substring(with: r)
+        let after = n.text.substring(with: NSRange(location: NSMaxRange(r), length: end - NSMaxRange(r)))
+        let base: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.labelColor]
+        s.append(NSAttributedString(string: (start > 0 ? "…" : "") + before.replacingOccurrences(of: "　", with: " "), attributes: base))
+        s.append(NSAttributedString(string: match, attributes: [.font: NSFont.boldSystemFont(ofSize: 13), .foregroundColor: NSColor.controlAccentColor]))
+        s.append(NSAttributedString(string: after.replacingOccurrences(of: "　", with: " ") + "…", attributes: base))
+        return s
+    }
+
+    func next() { if !hits.isEmpty { go(to: (current + 1) % hits.count) } }
+    func previous() { if !hits.isEmpty { go(to: (current - 1 + hits.count) % hits.count) } }
+
+    private func go(to i: Int) {
+        current = i
+        table.selectRowIndexes([i], byExtendingSelection: false)
+        table.scrollRowToVisible(i)
+        onJump?(hits[i])
+    }
+
+    @objc private func rowClicked() {
+        if table.clickedRow >= 0 { go(to: table.clickedRow) }
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { hits.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let id = NSUserInterfaceItemIdentifier("cell")
+        let label = tableView.makeView(withIdentifier: id, owner: nil) as? NSTextField ?? {
+            let l = NSTextField(wrappingLabelWithString: "")
+            l.identifier = id
+            l.maximumNumberOfLines = 2
+            l.lineBreakMode = .byTruncatingTail
+            return l
+        }()
+        label.attributedStringValue = hits[row].title
+        return label
+    }
+}
+
 // MARK: - 标签栏（Safari 的“分开式”布局：工具栏下面一排等宽标签）
 
 final class TabItem: NSView {
@@ -1187,6 +1367,14 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
     private var tabObservations: [ObjectIdentifier: [NSKeyValueObservation]] = [:]
     private var closedTabs: [URL] = []
     let autoBrowser = AutoBrowser()
+    private lazy var novelSearch: NovelSearchController = {
+        let s = NovelSearchController()
+        s.novel = { [weak self] in self?.novel }
+        s.onJump = { [weak self] hit in self?.jumpToSearchHit(hit) }
+        return s
+    }()
+    /// 搜索跳过来时要高亮的关键词位置（全文坐标），翻页就清掉
+    private var searchHighlight: NSRange?
     private var pendingRightClick: NSEvent?
     private var rightClickTimer: DispatchWorkItem?
     let prevZone = HotZone()
@@ -1609,7 +1797,13 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
         pageLength = box.fitLength(n.text, from: offset)
         if Prefs.sentenceBreak { pageLength = sentenceCut(n.text, from: offset, length: pageLength) }
         let page = n.text.substring(with: NSRange(location: offset, length: pageLength))
-        box.display(page.trimmingCharacters(in: .whitespaces), style: .novel, direction: direction)
+        let trimmed = page.trimmingCharacters(in: .whitespaces)
+        let lead = (page as NSString).range(of: trimmed).location
+        var mark: NSRange?
+        if let h = searchHighlight, h.location >= offset, NSMaxRange(h) <= offset + pageLength {
+            mark = NSRange(location: h.location - offset - (lead == NSNotFound ? 0 : lead), length: h.length)
+        }
+        box.display(trimmed, style: .novel, direction: direction, highlight: mark)
         box.toolTip = positionDescription()
     }
 
@@ -1670,6 +1864,8 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
                     self.novel = n
                     self.offset = Prefs.offset(for: path)
                     self.history = Prefs.history(for: path)
+                    self.searchHighlight = nil
+                    self.novelSearch.reset()
                     Prefs.novelPath = path
                     self.render()
                 case .failure(let err):
@@ -1682,7 +1878,7 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
 
     private func moveTo(_ newOffset: Int, remember: Bool = true, direction: Int = 0) {
         guard let n = novel else { return }
-        if direction != 0 { autoBrowser.ignoreMouseBriefly() }
+        if direction != 0 { autoBrowser.ignoreMouseBriefly(); searchHighlight = nil }
         if remember {
             history.append(offset)
             if history.count > 1000 { history.removeFirst() }
@@ -1710,6 +1906,7 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
     // MARK: 老板模式
 
     func setBoss(_ on: Bool) {
+        if on { novelSearch.window?.orderOut(nil) }   // 老板来了，搜索窗口一起藏
         boss = on
         if on, box.isEditing { box.endEditing() }
         if on { saveProgress() }
@@ -1748,6 +1945,33 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
     @objc func setFontSize(_ sender: NSMenuItem) { Prefs.fontSize = sender.tag; applyTextPrefs() }
     @objc func setTextStyle(_ sender: NSMenuItem) { Prefs.textStyle = sender.tag; applyTextPrefs() }
     @objc func toggleAutoHide(_ sender: Any?) { Prefs.autoHide.toggle() }
+
+    // MARK: 搜索跳转
+
+    @objc func searchNovel(_ sender: Any?) {
+        guard novel != nil else { return openNovel(nil) }
+        if boss { setBoss(false) }
+        novelSearch.show()
+    }
+    @objc func nextSearchResult(_ sender: Any?) { novelSearch.next() }
+    @objc func previousSearchResult(_ sender: Any?) { novelSearch.previous() }
+
+    private static let sentenceStarts = CharacterSet(charactersIn: "。！？；…!?;　")
+
+    /// 跳到搜索结果：从关键词所在句子的开头开始显示，免得只看到半句
+    private func jumpToSearchHit(_ hit: NovelSearchController.Hit) {
+        guard let n = novel, !boss else { return }
+        var start = hit.offset
+        var i = hit.offset - 1
+        while i >= max(0, hit.offset - 60) {
+            if let u = UnicodeScalar(n.text.character(at: i)), Self.sentenceStarts.contains(u) { start = i + 1; break }
+            i -= 1
+        }
+        searchHighlight = NSRange(location: hit.offset, length: hit.length)
+        moveTo(start)
+        // 关键词太靠后、这一页放不下时，就直接从关键词开始
+        if hit.offset + hit.length > offset + pageLength { moveTo(hit.offset, remember: false) }
+    }
     @objc func toggleRightClickBoss(_ sender: Any?) { Prefs.rightClickBoss.toggle() }
 
     @objc func toggleAutoBrowse(_ sender: Any?) {
@@ -2049,6 +2273,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         add(bm, "下一页", #selector(BrowserController.nextPageAction(_:)), target: c)   // 快捷键写在标题里，不设 keyEquivalent，免得抢走地址栏里的 ⌘C
         add(bm, "上一页", #selector(BrowserController.prevPageAction(_:)), target: c)
         add(bm, "跳转章节…", #selector(BrowserController.jumpChapter(_:)), "j", target: c)
+        add(bm, "在小说中搜索…", #selector(BrowserController.searchNovel(_:)), "f", [.command, .option], target: c)
+        add(bm, "下一个搜索结果", #selector(BrowserController.nextSearchResult(_:)), "g", [.command, .option], target: c)
+        add(bm, "上一个搜索结果", #selector(BrowserController.previousSearchResult(_:)), "g", [.command, .option, .shift], target: c)
         bm.addItem(.separator())
         add(bm, "老板模式", #selector(BrowserController.toggleBossAction(_:)), target: c)
         add(bm, "在网页上双击右键进入老板模式", #selector(BrowserController.toggleRightClickBoss(_:)), target: c)
