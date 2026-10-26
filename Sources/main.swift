@@ -14,7 +14,7 @@ enum Prefs {
             "autoHide": true, "homeURL": "https://www.google.com",
             "hotZoneSize": 60, "hotZoneVisible": false, "sentenceBreak": true, "maxBoxWidth": 760,
             "pageTransition": 1, "transitionSpeed": 45,
-            "autoBrowseClicks": false, "autoBrowseSpeed": 2,
+            "autoBrowseClicks": false, "autoBrowseSpeed": 2, "rightClickBoss": true,
         ])
     }
 
@@ -81,6 +81,11 @@ enum Prefs {
     static var autoBrowseSpeed: Int {
         get { d.integer(forKey: "autoBrowseSpeed") }
         set { d.set(newValue, forKey: "autoBrowseSpeed") }
+    }
+    /// 在网页上连点两下右键直接进入老板模式
+    static var rightClickBoss: Bool {
+        get { d.bool(forKey: "rightClickBoss") }
+        set { d.set(newValue, forKey: "rightClickBoss") }
     }
     /// 上次打开的所有标签页，下次启动时恢复
     static var tabURLs: [String]? {
@@ -1157,6 +1162,8 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
     private var tabObservations: [ObjectIdentifier: [NSKeyValueObservation]] = [:]
     private var closedTabs: [URL] = []
     let autoBrowser = AutoBrowser()
+    private var pendingRightClick: NSEvent?
+    private var rightClickTimer: DispatchWorkItem?
     let prevZone = HotZone()
     let nextZone = HotZone()
     private var sidebarButton: NSButton!
@@ -1401,6 +1408,29 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
             guard self.webView.frame.contains(p), !inCorner else { return e }
             if e.type == .mouseMoved { self.autoBrowser.mouseMoved(to: p) } else { self.autoBrowser.mouseClickedOrScrolled() }
             return e
+        }
+
+        // 双击右键 = 老板键（只进不出）。第一下先压住，短时间内没有第二下，再照常弹出右键菜单
+        NSEvent.addLocalMonitorForEvents(matching: [.rightMouseDown, .rightMouseUp]) { [weak self] e in
+            guard let self, Prefs.rightClickBoss, !self.boss, e.window === self.window else { return e }
+            let p = self.root.convert(e.locationInWindow, from: nil)
+            guard self.webView.frame.contains(p) else { return e }
+            if e.type == .rightMouseUp { return self.pendingRightClick == nil ? e : nil }
+            if self.pendingRightClick != nil {
+                self.rightClickTimer?.cancel()
+                self.pendingRightClick = nil
+                self.setBoss(true)
+                return nil
+            }
+            self.pendingRightClick = e
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, let first = self.pendingRightClick else { return }
+                self.pendingRightClick = nil
+                self.window?.sendEvent(first)   // 直接交给窗口，不再经过这个监听
+            }
+            self.rightClickTimer = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + min(NSEvent.doubleClickInterval, 0.4), execute: work)
+            return nil
         }
 
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
@@ -1665,6 +1695,7 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
     @objc func setFontSize(_ sender: NSMenuItem) { Prefs.fontSize = sender.tag; applyTextPrefs() }
     @objc func setTextStyle(_ sender: NSMenuItem) { Prefs.textStyle = sender.tag; applyTextPrefs() }
     @objc func toggleAutoHide(_ sender: Any?) { Prefs.autoHide.toggle() }
+    @objc func toggleRightClickBoss(_ sender: Any?) { Prefs.rightClickBoss.toggle() }
 
     @objc func toggleAutoBrowse(_ sender: Any?) {
         if autoBrowser.isRunning {
@@ -1742,6 +1773,7 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
         case #selector(toggleAutoBrowse(_:)):
             item.state = autoBrowser.isRunning ? .on : .off
             item.title = "自动浏览（\(ShortcutAction.autoBrowse.label)）"
+        case #selector(toggleRightClickBoss(_:)): item.state = Prefs.rightClickBoss ? .on : .off
         case #selector(toggleAutoBrowseClicks(_:)): item.state = Prefs.autoBrowseClicks ? .on : .off
         case #selector(setAutoBrowseSpeed(_:)): item.state = item.tag == Prefs.autoBrowseSpeed ? .on : .off
         case #selector(nextPageAction(_:)): item.title = "下一页（\(ShortcutAction.nextPage.label)）"
@@ -1965,6 +1997,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         add(bm, "跳转章节…", #selector(BrowserController.jumpChapter(_:)), "j", target: c)
         bm.addItem(.separator())
         add(bm, "老板模式", #selector(BrowserController.toggleBossAction(_:)), target: c)
+        add(bm, "在网页上双击右键进入老板模式", #selector(BrowserController.toggleRightClickBoss(_:)), target: c)
         add(bm, "快捷键设置…", #selector(showShortcutSettings(_:)), target: self)
         bm.addItem(.separator())
         add(bm, "自动浏览", #selector(BrowserController.toggleAutoBrowse(_:)), target: c)
