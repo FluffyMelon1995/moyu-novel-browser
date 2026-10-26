@@ -167,20 +167,272 @@ final class Novel {
     }
 }
 
+// MARK: - 快捷键
+
+struct Shortcut: Codable, Equatable {
+    var keyCode: Int
+    var mods: UInt   // NSEvent.ModifierFlags 里的 ⌘⌥⌃⇧
+    var label: String
+
+    static let modMask: NSEvent.ModifierFlags = [.command, .option, .control, .shift]
+
+    init(keyCode: Int, mods: NSEvent.ModifierFlags, label: String) {
+        self.keyCode = keyCode
+        self.mods = mods.intersection(Shortcut.modMask).rawValue
+        self.label = label
+    }
+
+    init(event e: NSEvent) {
+        let flags = e.modifierFlags.intersection(Shortcut.modMask)
+        self.init(keyCode: Int(e.keyCode), mods: flags, label: Shortcut.describe(keyCode: Int(e.keyCode), flags: flags, event: e))
+    }
+
+    var flags: NSEvent.ModifierFlags { NSEvent.ModifierFlags(rawValue: mods) }
+
+    func matches(_ e: NSEvent) -> Bool {
+        Int(e.keyCode) == keyCode && e.modifierFlags.intersection(Shortcut.modMask) == flags
+    }
+
+    func sameKeys(_ other: Shortcut) -> Bool { keyCode == other.keyCode && mods == other.mods }
+
+    var carbonModifiers: Int {
+        var m = 0
+        if flags.contains(.command) { m |= cmdKey }
+        if flags.contains(.option) { m |= optionKey }
+        if flags.contains(.control) { m |= controlKey }
+        if flags.contains(.shift) { m |= shiftKey }
+        return m
+    }
+
+    private static let keyNames: [Int: String] = [
+        kVK_Escape: "Esc", kVK_Return: "↩", kVK_Tab: "⇥", kVK_Space: "Space", kVK_Delete: "⌫",
+        kVK_ForwardDelete: "⌦", kVK_LeftArrow: "←", kVK_RightArrow: "→", kVK_DownArrow: "↓", kVK_UpArrow: "↑",
+        kVK_Home: "Home", kVK_End: "End", kVK_PageUp: "PgUp", kVK_PageDown: "PgDn", kVK_ANSI_Grave: "`",
+        kVK_F1: "F1", kVK_F2: "F2", kVK_F3: "F3", kVK_F4: "F4", kVK_F5: "F5", kVK_F6: "F6",
+        kVK_F7: "F7", kVK_F8: "F8", kVK_F9: "F9", kVK_F10: "F10", kVK_F11: "F11", kVK_F12: "F12",
+    ]
+
+    static func describe(keyCode: Int, flags: NSEvent.ModifierFlags, event: NSEvent?) -> String {
+        var s = ""
+        if flags.contains(.control) { s += "⌃" }
+        if flags.contains(.option) { s += "⌥" }
+        if flags.contains(.shift) { s += "⇧" }
+        if flags.contains(.command) { s += "⌘" }
+        let key = keyNames[keyCode] ?? event?.charactersIgnoringModifiers?.uppercased() ?? "#\(keyCode)"
+        return s + key
+    }
+}
+
+enum ShortcutAction: String, CaseIterable {
+    case nextPage, prevPage, boss, globalBoss
+
+    var title: String {
+        switch self {
+        case .nextPage: return "下一页"
+        case .prevPage: return "上一页"
+        case .boss: return "老板键"
+        case .globalBoss: return "全局老板键"
+        }
+    }
+
+    var defaultShortcut: Shortcut {
+        switch self {
+        case .nextPage: return Shortcut(keyCode: kVK_ANSI_C, mods: .command, label: "⌘C")
+        case .prevPage: return Shortcut(keyCode: kVK_ANSI_V, mods: .command, label: "⌘V")
+        case .boss: return Shortcut(keyCode: kVK_Escape, mods: [], label: "Esc")
+        case .globalBoss: return Shortcut(keyCode: kVK_ANSI_Grave, mods: .option, label: "⌥`")
+        }
+    }
+
+    private var key: String { "shortcut.\(rawValue)" }
+
+    /// nil = 已清除（不用快捷键）
+    var shortcut: Shortcut? {
+        guard let data = Prefs.d.data(forKey: key) else { return defaultShortcut }
+        return try? JSONDecoder().decode(Shortcut.self, from: data)
+    }
+
+    func set(_ s: Shortcut?) {
+        let data = s.flatMap { try? JSONEncoder().encode($0) } ?? Data()
+        Prefs.d.set(data, forKey: key)
+    }
+
+    func reset() { Prefs.d.removeObject(forKey: key) }
+
+    var label: String { shortcut?.label ?? "无" }
+
+    static let didChange = Notification.Name("ShortcutsDidChange")
+}
+
 // MARK: - 全局快捷键（Carbon，不需要辅助功能权限）
 
 enum HotKey {
     static var handler: (() -> Void)?
     private static var ref: EventHotKeyRef?
+    private static var installed = false
 
-    static func register(keyCode: Int, modifiers: Int) {
-        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
-            HotKey.handler?()
-            return noErr
-        }, 1, &spec, nil, nil)
+    static func register(_ shortcut: Shortcut?) {
+        if !installed {
+            installed = true
+            var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+            InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+                HotKey.handler?()
+                return noErr
+            }, 1, &spec, nil, nil)
+        }
+        unregister()
+        guard let s = shortcut else { return }
         let id = EventHotKeyID(signature: OSType(0x4E56_4C42), id: 1)
-        RegisterEventHotKey(UInt32(keyCode), UInt32(modifiers), id, GetApplicationEventTarget(), 0, &ref)
+        RegisterEventHotKey(UInt32(s.keyCode), UInt32(s.carbonModifiers), id, GetApplicationEventTarget(), 0, &ref)
+    }
+
+    static func unregister() {
+        if let r = ref { UnregisterEventHotKey(r) }
+        ref = nil
+    }
+}
+
+// MARK: - 快捷键设置窗口
+
+final class ShortcutRecorder: NSButton {
+    static var isRecording = false
+    let shortcutAction: ShortcutAction
+    var onRecorded: ((Shortcut) -> Void)?
+    private var monitor: Any?
+
+    init(action: ShortcutAction) {
+        shortcutAction = action
+        super.init(frame: .zero)
+        bezelStyle = .rounded
+        target = self
+        self.action = #selector(toggleRecording)
+        refresh()
+        widthAnchor.constraint(equalToConstant: 170).isActive = true
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func refresh() { title = monitor == nil ? shortcutAction.label : "请按下新快捷键…" }
+
+    @objc private func toggleRecording() {
+        monitor == nil ? start() : stop()
+    }
+
+    private func start() {
+        ShortcutRecorder.isRecording = true
+        HotKey.unregister()   // 录制时先放开全局快捷键，不然按不进来
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+            guard let self else { return e }
+            self.stop()
+            self.onRecorded?(Shortcut(event: e))
+            return nil
+        }
+        refresh()
+    }
+
+    func stop() {
+        if let m = monitor { NSEvent.removeMonitor(m) }
+        monitor = nil
+        ShortcutRecorder.isRecording = false
+        HotKey.register(ShortcutAction.globalBoss.shortcut)
+        refresh()
+    }
+}
+
+final class ShortcutSettingsController: NSWindowController, NSWindowDelegate {
+    private var recorders: [ShortcutRecorder] = []
+    private let status = NSTextField(labelWithString: "")
+
+    init() {
+        let win = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 520, height: 260),
+                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        win.title = "快捷键设置"
+        super.init(window: win)
+        win.delegate = self
+
+        let grid = NSGridView()
+        grid.rowSpacing = 10
+        grid.columnSpacing = 10
+        for action in ShortcutAction.allCases {
+            let rec = ShortcutRecorder(action: action)
+            rec.onRecorded = { [weak self] s in self?.apply(s, to: action) }
+            recorders.append(rec)
+            let clear = NSButton(title: "清除", target: self, action: #selector(clearRow(_:)))
+            let reset = NSButton(title: "恢复默认", target: self, action: #selector(resetRow(_:)))
+            clear.tag = recorders.count - 1
+            reset.tag = recorders.count - 1
+            grid.addRow(with: [NSTextField(labelWithString: action.title), rec, clear, reset])
+        }
+        grid.column(at: 0).xPlacement = .trailing
+
+        status.textColor = .secondaryLabelColor
+        status.lineBreakMode = .byWordWrapping
+        status.preferredMaxLayoutWidth = 480
+        let note = NSTextField(wrappingLabelWithString:
+            "点击按钮后按下新的组合键。“全局老板键”在 App 处于后台时也能用，必须带 ⌘、⌥ 或 ⌃。不带修饰键的普通字母会影响在网页里打字。")
+        note.textColor = .tertiaryLabelColor
+        note.font = .systemFont(ofSize: 11)
+        let resetAll = NSButton(title: "全部恢复默认", target: self, action: #selector(resetAll))
+
+        let stack = NSStackView(views: [grid, status, note, resetAll])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        note.widthAnchor.constraint(lessThanOrEqualToConstant: 480).isActive = true
+        win.contentView = stack
+        win.center()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func apply(_ s: Shortcut, to action: ShortcutAction) {
+        if action == .globalBoss, s.flags.intersection([.command, .option, .control]).isEmpty {
+            return fail("全局老板键至少要带 ⌘、⌥ 或 ⌃，不然会影响所有 App 的打字。")
+        }
+        if let other = ShortcutAction.allCases.first(where: { $0 != action && $0.shortcut.map(s.sameKeys) == true }) {
+            return fail("\(s.label) 已经被「\(other.title)」占用了。")
+        }
+        action.set(s)
+        changed("「\(action.title)」改成了 \(s.label)")
+    }
+
+    private func fail(_ msg: String) {
+        NSSound.beep()
+        status.textColor = .systemRed
+        status.stringValue = msg
+    }
+
+    private func changed(_ msg: String) {
+        status.textColor = .secondaryLabelColor
+        status.stringValue = msg
+        recorders.forEach { $0.refresh() }
+        HotKey.register(ShortcutAction.globalBoss.shortcut)
+        NotificationCenter.default.post(name: ShortcutAction.didChange, object: nil)
+    }
+
+    @objc private func clearRow(_ sender: NSButton) {
+        let a = recorders[sender.tag].shortcutAction
+        a.set(nil)
+        changed("已清除「\(a.title)」的快捷键")
+    }
+
+    @objc private func resetRow(_ sender: NSButton) {
+        let a = recorders[sender.tag].shortcutAction
+        if let other = ShortcutAction.allCases.first(where: { $0 != a && $0.shortcut.map(a.defaultShortcut.sameKeys) == true }) {
+            return fail("默认的 \(a.defaultShortcut.label) 已经被「\(other.title)」占用了，请先改掉那一项。")
+        }
+        a.reset()
+        changed("「\(a.title)」恢复为 \(a.label)")
+    }
+
+    @objc private func resetAll() {
+        ShortcutAction.allCases.forEach { $0.reset() }
+        changed("所有快捷键都恢复默认了")
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        recorders.forEach { $0.stop() }
     }
 }
 
@@ -598,15 +850,24 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
         }
 
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
-            guard let self, !self.box.isEditing else { return e }
-            let flags = e.modifierFlags.intersection([.command, .option, .control, .shift])
-            if e.keyCode == UInt16(kVK_Escape), flags.isEmpty {
+            guard let self, !ShortcutRecorder.isRecording, e.window === self.window, !self.box.isEditing else { return e }
+            if ShortcutAction.boss.shortcut?.matches(e) == true {
                 self.toggleBoss()
                 return nil   // 不能传给网页：WKWebView 会把没处理的按键再发回来，导致切换两次
             }
-            // ⌘C 下一页、⌘V 上一页（编辑地址栏和老板模式时照常复制粘贴）
-            if flags == .command, !self.boss, e.keyCode == UInt16(kVK_ANSI_C) { self.nextPage(); return nil }
-            if flags == .command, !self.boss, e.keyCode == UInt16(kVK_ANSI_V) { self.prevPage(); return nil }
+            // 翻页键只在显示小说时生效；老板模式下照常交给网页（比如 ⌘C 复制）
+            if !self.boss, ShortcutAction.nextPage.shortcut?.matches(e) == true { self.nextPage(); return nil }
+            if !self.boss, ShortcutAction.prevPage.shortcut?.matches(e) == true { self.prevPage(); return nil }
+            // ⌘C / ⌘V 被拿去翻页时，用 ⌥⌘C / ⌥⌘V 复制粘贴
+            let flags = e.modifierFlags.intersection(Shortcut.modMask)
+            if flags == [.command, .option], e.keyCode == UInt16(kVK_ANSI_C) {
+                NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: self)
+                return nil
+            }
+            if flags == [.command, .option], e.keyCode == UInt16(kVK_ANSI_V) {
+                NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: self)
+                return nil
+            }
             return e
         }
     }
@@ -894,18 +1155,24 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         switch item.action {
+        case #selector(nextPageAction(_:)): item.title = "下一页（\(ShortcutAction.nextPage.label)）"
+        case #selector(prevPageAction(_:)): item.title = "上一页（\(ShortcutAction.prevPage.label)）"
+        case #selector(toggleBossAction(_:)):
+            item.state = boss ? .on : .off
+            item.title = "老板模式（\(ShortcutAction.boss.label) / 全局 \(ShortcutAction.globalBoss.label)）"
+        case #selector(toggleAutoHide(_:)):
+            item.state = Prefs.autoHide ? .on : .off
+            item.title = "切到别的 App 时隐藏（按 \(ShortcutAction.boss.label) 恢复）"
         case #selector(setLines(_:)): item.state = item.tag == Prefs.lines ? .on : .off
         case #selector(setFontSize(_:)): item.state = item.tag == Prefs.fontSize ? .on : .off
         case #selector(setTextStyle(_:)): item.state = item.tag == Prefs.textStyle ? .on : .off
         case #selector(setAutoFlip(_:)): item.state = item.tag == Prefs.autoFlip ? .on : .off
-        case #selector(toggleAutoHide(_:)): item.state = Prefs.autoHide ? .on : .off
         case #selector(setPageTransition(_:)): item.state = item.tag == Prefs.pageTransition ? .on : .off
         case #selector(setTransitionSpeed(_:)): item.state = item.tag == Prefs.transitionSpeed ? .on : .off
         case #selector(setMaxBoxWidth(_:)): item.state = item.tag == Prefs.maxBoxWidth ? .on : .off
         case #selector(toggleSentenceBreak(_:)): item.state = Prefs.sentenceBreak ? .on : .off
         case #selector(toggleHotZoneVisible(_:)): item.state = Prefs.hotZoneVisible ? .on : .off
         case #selector(setHotZoneSize(_:)): item.state = item.tag == Prefs.hotZoneSize ? .on : .off
-        case #selector(toggleBossAction(_:)): item.state = boss ? .on : .off
         case #selector(goBack(_:)): return webView.canGoBack
         case #selector(goForward(_:)): return webView.canGoForward
         default: break
@@ -1010,6 +1277,7 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var controller: BrowserController!
+    private var shortcutSettings: ShortcutSettingsController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Prefs.register()
@@ -1017,9 +1285,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = buildMenu()
         controller.showWindow(nil)
         controller.start()
-        HotKey.handler = { [weak self] in self?.controller.toggleBoss() }
-        HotKey.register(keyCode: kVK_ANSI_Grave, modifiers: optionKey)
+        HotKey.handler = { [weak self] in
+            guard !ShortcutRecorder.isRecording else { return }
+            self?.controller.toggleBoss()
+        }
+        HotKey.register(ShortcutAction.globalBoss.shortcut)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc func showShortcutSettings(_ sender: Any?) {
+        if shortcutSettings == nil { shortcutSettings = ShortcutSettingsController() }
+        shortcutSettings?.showWindow(nil)
+        shortcutSettings?.window?.makeKeyAndOrderFront(nil)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -1051,6 +1328,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let app = submenu(name)
         add(app, "About \(name)", #selector(NSApplication.orderFrontStandardAboutPanel(_:)))
         app.addItem(.separator())
+        add(app, "Settings…", #selector(showShortcutSettings(_:)), ",", target: self)
+        app.addItem(.separator())
         add(app, "Hide \(name)", #selector(NSApplication.hide(_:)), "h")
         add(app, "Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option])
         add(app, "Show All", #selector(NSApplication.unhideAllApplications(_:)))
@@ -1069,8 +1348,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         edit.addItem(.separator())
         add(edit, "Cut", #selector(NSText.cut(_:)), "x")
         // ⌘C / ⌘V 被拿去翻页了，复制粘贴改用 ⌥⌘C / ⌥⌘V
-        add(edit, "Copy", #selector(NSText.copy(_:)), "c", [.command, .option])
-        add(edit, "Paste", #selector(NSText.paste(_:)), "v", [.command, .option])
+        add(edit, "Copy", #selector(NSText.copy(_:)), "c")
+        add(edit, "Paste", #selector(NSText.paste(_:)), "v")
         add(edit, "Select All", #selector(NSText.selectAll(_:)), "a")
 
         let view = submenu("View")
@@ -1089,11 +1368,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // 阅读相关的都藏在 Bookmarks 菜单里
         let bm = submenu("Bookmarks")
-        add(bm, "下一页", #selector(BrowserController.nextPageAction(_:)), "c", target: c)
-        add(bm, "上一页", #selector(BrowserController.prevPageAction(_:)), "v", target: c)
+        add(bm, "下一页", #selector(BrowserController.nextPageAction(_:)), target: c)   // 快捷键写在标题里，不设 keyEquivalent，免得抢走地址栏里的 ⌘C
+        add(bm, "上一页", #selector(BrowserController.prevPageAction(_:)), target: c)
         add(bm, "跳转章节…", #selector(BrowserController.jumpChapter(_:)), "j", target: c)
         bm.addItem(.separator())
-        add(bm, "老板模式（Esc 或 ⌥`）", #selector(BrowserController.toggleBossAction(_:)), target: c)
+        add(bm, "老板模式", #selector(BrowserController.toggleBossAction(_:)), target: c)
+        add(bm, "快捷键设置…", #selector(showShortcutSettings(_:)), target: self)
         add(bm, "切到别的 App 时隐藏（按 Esc 恢复）", #selector(BrowserController.toggleAutoHide(_:)), target: c)
         bm.addItem(.separator())
 
