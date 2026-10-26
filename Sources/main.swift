@@ -520,6 +520,10 @@ final class AddressBox: NSView, NSTextFieldDelegate {
     var onPage: ((Int) -> Void)?
     var onEditingChanged: (() -> Void)?
     var onReload: (() -> Void)?
+    /// 点地址栏左边的小锁图标
+    var onIconClick: (() -> Void)?
+    /// 自动浏览开着时，小锁微微变成强调色，只有你自己知道是什么意思
+    var iconActive = false { didSet { icon.contentTintColor = iconActive ? .controlAccentColor : .secondaryLabelColor } }
 
     private(set) var isEditing = false
 
@@ -686,7 +690,11 @@ final class AddressBox: NSView, NSTextFieldDelegate {
         return reloadButton.frame.contains(p) ? reloadButton : self
     }
 
-    override func mouseDown(with event: NSEvent) { beginEditing() }
+    override func mouseDown(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        if p.x < 28, let click = onIconClick { return click() }   // 小锁那一块
+        beginEditing()
+    }
 
     func beginEditing() {
         guard !isEditing else { return }
@@ -1188,7 +1196,7 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
     private var forwardButton: NSButton!
     private var shareButton: NSButton!
     private var newTabButton: NSButton!
-    private var bossButton: NSButton!
+    private var tabsButton: NSButton!
 
     private var novel: Novel?
     private var offset = 0
@@ -1251,14 +1259,14 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
         tabStrip.onSelect = { [weak self] i in self?.selectTab(i) }
         tabStrip.onClose = { [weak self] i in self?.closeTab(i) }
 
-        // 外观上和 Safari 一样；“边栏”= 跳转章节，“所有标签页”= 老板键
+        // 外观上和 Safari 一样；“边栏”= 跳转章节，地址栏左边的小锁 = 自动浏览开关
         sidebarButton = symbolButton("sidebar.left", #selector(jumpChapter(_:)), "显示边栏")
         backButton = symbolButton("chevron.left", #selector(goBack(_:)), "后退")
         forwardButton = symbolButton("chevron.right", #selector(goForward(_:)), "前进")
         shareButton = symbolButton("square.and.arrow.up", #selector(copyURL(_:)), "共享")
         newTabButton = symbolButton("plus", #selector(newTab(_:)), "新建标签页")
-        bossButton = symbolButton("square.on.square", #selector(toggleBossAction(_:)), "显示所有标签页")
-        for b in [sidebarButton!, backButton!, forwardButton!, shareButton!, newTabButton!, bossButton!] {
+        tabsButton = symbolButton("square.on.square", #selector(showAllTabs(_:)), "显示所有标签页")
+        for b in [sidebarButton!, backButton!, forwardButton!, shareButton!, newTabButton!, tabsButton!] {
             bar.addSubview(b)
         }
         bar.addSubview(box)
@@ -1266,6 +1274,7 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
         box.onSubmit = { [weak self] text in self?.open(text) }
         box.onPage = { [weak self] d in d > 0 ? self?.nextPage() : self?.prevPage() }
         box.onReload = { [weak self] in self?.reload(nil) }
+        box.onIconClick = { [weak self] in self?.toggleAutoBrowse(nil) }
         box.onEditingChanged = { [weak self] in
             guard let self else { return }
             if !self.box.isEditing { self.render() }
@@ -1403,6 +1412,26 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
         box.beginEditing()   // 像 Safari 一样，新标签页直接可以输入网址
     }
 
+    /// 点“所有标签页”按钮：列出全部标签，点一下切过去
+    @objc func showAllTabs(_ sender: NSButton) {
+        let menu = NSMenu()
+        for (i, t) in tabs.enumerated() {
+            let title = t.title.flatMap { $0.isEmpty ? nil : $0 } ?? t.url?.host ?? "New Tab"
+            let item = NSMenuItem(title: title, action: #selector(pickTab(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = i
+            item.state = t === webView ? .on : .off
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        let new = NSMenuItem(title: "New Tab", action: #selector(newTab(_:)), keyEquivalent: "")
+        new.target = self
+        menu.addItem(new)
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+    }
+
+    @objc private func pickTab(_ sender: NSMenuItem) { selectTab(sender.tag) }
+
     @objc func closeCurrentTab(_ sender: Any?) { closeTab(currentIndex) }
     @objc func closeWindow(_ sender: Any?) { window?.performClose(nil) }
     @objc func nextTab(_ sender: Any?) { selectTab((currentIndex + 1) % tabs.count) }
@@ -1523,7 +1552,7 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
             x += 30 + gap
         }
         var rx = W - 12
-        for b in [bossButton!, newTabButton!, shareButton!] {
+        for b in [tabsButton!, newTabButton!, shareButton!] {
             rx -= 30
             b.frame = NSRect(x: rx, y: cy - 14, width: 30, height: 28)
             rx -= 8
@@ -1729,6 +1758,7 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
             window?.acceptsMouseMovedEvents = true   // 用来发现你自己动了鼠标
             autoBrowser.start()
         }
+        box.iconActive = autoBrowser.isRunning
     }
     @objc func toggleAutoBrowseClicks(_ sender: Any?) { Prefs.autoBrowseClicks.toggle() }
     @objc func setAutoBrowseSpeed(_ sender: NSMenuItem) { Prefs.autoBrowseSpeed = sender.tag }
