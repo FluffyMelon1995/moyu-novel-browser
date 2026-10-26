@@ -14,6 +14,7 @@ enum Prefs {
             "autoHide": true, "homeURL": "https://www.google.com",
             "hotZoneSize": 60, "hotZoneVisible": false, "sentenceBreak": true, "maxBoxWidth": 760,
             "pageTransition": 1, "transitionSpeed": 45,
+            "autoBrowseClicks": false, "autoBrowseSpeed": 2,
         ])
     }
 
@@ -70,6 +71,16 @@ enum Prefs {
     static var lastURL: String? {
         get { d.string(forKey: "lastURL") }
         set { d.set(newValue, forKey: "lastURL") }
+    }
+    /// 自动浏览时会不会点击站内链接（默认只滚动，比较安全）
+    static var autoBrowseClicks: Bool {
+        get { d.bool(forKey: "autoBrowseClicks") }
+        set { d.set(newValue, forKey: "autoBrowseClicks") }
+    }
+    /// 自动浏览速度：1 慢、2 适中、3 快
+    static var autoBrowseSpeed: Int {
+        get { d.integer(forKey: "autoBrowseSpeed") }
+        set { d.set(newValue, forKey: "autoBrowseSpeed") }
     }
     /// 上次打开的所有标签页，下次启动时恢复
     static var tabURLs: [String]? {
@@ -233,7 +244,7 @@ struct Shortcut: Codable, Equatable {
 }
 
 enum ShortcutAction: String, CaseIterable {
-    case nextPage, prevPage, boss, globalBoss
+    case nextPage, prevPage, boss, globalBoss, autoBrowse
 
     var title: String {
         switch self {
@@ -241,6 +252,7 @@ enum ShortcutAction: String, CaseIterable {
         case .prevPage: return "上一页"
         case .boss: return "老板键"
         case .globalBoss: return "全局老板键"
+        case .autoBrowse: return "自动浏览开关"
         }
     }
 
@@ -250,6 +262,7 @@ enum ShortcutAction: String, CaseIterable {
         case .prevPage: return Shortcut(keyCode: kVK_ANSI_V, mods: .command, label: "⌘V")
         case .boss: return Shortcut(keyCode: kVK_Escape, mods: [], label: "Esc")
         case .globalBoss: return Shortcut(keyCode: kVK_ANSI_Grave, mods: .option, label: "⌥`")
+        case .autoBrowse: return Shortcut(keyCode: kVK_ANSI_A, mods: [.command, .option], label: "⌥⌘A")
         }
     }
 
@@ -390,6 +403,7 @@ final class ShortcutSettingsController: NSWindowController, NSWindowDelegate {
         stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
         note.widthAnchor.constraint(lessThanOrEqualToConstant: 480).isActive = true
         win.contentView = stack
+        win.setContentSize(stack.fittingSize)
         win.center()
     }
 
@@ -727,6 +741,303 @@ final class AddressBox: NSView, NSTextFieldDelegate {
 
 // MARK: - 浏览器窗口
 
+// MARK: - 自动浏览（假光标 + 自动滚动 + 点击站内链接）
+
+/// 画在窗口最上层的假鼠标指针，不拦截任何点击
+final class FakeCursor: NSImageView {
+    private(set) var isHand = false
+
+    init() {
+        super.init(frame: .zero)
+        imageScaling = .scaleNone
+        setHand(false)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func setHand(_ hand: Bool) {
+        isHand = hand
+        let c: NSCursor = hand ? .pointingHand : .arrow
+        image = c.image
+        setFrameSize(c.image.size)
+    }
+
+    /// 指针尖端所在的位置（父视图是翻转坐标）
+    var tip: NSPoint {
+        let hs = (isHand ? NSCursor.pointingHand : NSCursor.arrow).hotSpot
+        return NSPoint(x: frame.minX + hs.x, y: frame.minY + hs.y)
+    }
+
+    func origin(forTip p: NSPoint) -> NSPoint {
+        let hs = (isHand ? NSCursor.pointingHand : NSCursor.arrow).hotSpot
+        return NSPoint(x: p.x - hs.x, y: p.y - hs.y)
+    }
+}
+
+final class AutoBrowser {
+    let cursor = FakeCursor()
+    var webView: () -> WKWebView = { fatalError() }
+    /// 后退按钮中心（root 坐标），走得太远时假光标会去点它
+    var backButtonCenter: () -> NSPoint = { .zero }
+    var goBack: () -> Void = {}
+
+    private(set) var isRunning = false
+    private var generation = 0
+    private var hops = 0
+    private var actionsSinceClick = 0
+    private var nextClickAfter = 5
+    /// 你在用鼠标时，假光标让开到这个时间点；之后从你的指针位置接回来
+    private var takeoverUntil = Date.distantPast
+    private var quietUntil = Date.distantPast
+    private var lastMouse: NSPoint?
+    private var moveAnchor: (point: NSPoint, time: Date)?
+    /// 真鼠标现在的位置（root 坐标），不在网页上时为 nil
+    var mouseLocation: () -> NSPoint? = { nil }
+
+    private var speed: Double { [1.7, 1.0, 0.6][min(2, max(0, Prefs.autoBrowseSpeed - 1))] }
+    private var isTakenOver: Bool { Date() < takeoverUntil }
+
+    func start() {
+        guard !isRunning else { return }
+        isRunning = true
+        generation += 1
+        hops = 0
+        actionsSinceClick = 0
+        takeoverUntil = .distantPast
+        showCursor(at: mouseLocation() ?? randomPoint())
+        NSCursor.setHiddenUntilMouseMoves(true)   // 真光标先藏起来，免得屏幕上有两个箭头
+        step()   // 一开启就马上动起来
+    }
+
+    func stop() {
+        isRunning = false
+        generation += 1
+        cursor.isHidden = true
+    }
+
+    /// 翻页之后的一小会儿不理会鼠标（宏鼠标按侧键翻页时手难免会带动鼠标）
+    func ignoreMouseBriefly() { quietUntil = Date().addingTimeInterval(1.5) }
+
+    /// 真鼠标在网页上移动了：大幅移动就交给你，停手 1.2 秒后假光标从你的指针位置接回去
+    func mouseMoved(to p: NSPoint) {
+        guard isRunning else { return }
+        let now = Date()
+        defer { lastMouse = p }
+        if isTakenOver {
+            // 接管期间只要还在动（超过手抖的幅度），就继续由你控制
+            if let last = lastMouse, hypot(p.x - last.x, p.y - last.y) > 4 { takeoverUntil = now.addingTimeInterval(1.2) }
+            return
+        }
+        if now >= quietUntil {
+            // 1 秒内累计移动超过 80 点才算接管，手抖、按键带动的小位移不算
+            if let a = moveAnchor, now.timeIntervalSince(a.time) < 1 {
+                if hypot(p.x - a.point.x, p.y - a.point.y) > 80 { moveAnchor = nil; return takeOver(for: 1.2) }
+            } else {
+                moveAnchor = (p, now)
+            }
+        }
+        NSCursor.setHiddenUntilMouseMoves(true)   // 没接管的话，把冒出来的真指针再藏回去
+    }
+
+    /// 真鼠标在网页上点击或滚动了：多让你一会儿
+    func mouseClickedOrScrolled() {
+        guard isRunning, Date() >= quietUntil else { return }
+        takeOver(for: 3)
+    }
+
+    private func takeOver(for seconds: Double) {
+        let wasTaken = isTakenOver
+        takeoverUntil = max(takeoverUntil, Date().addingTimeInterval(seconds))
+        cursor.isHidden = true
+        guard !wasTaken else { return }
+        generation += 1   // 取消假光标手上正在做的动作
+        waitForHandBack()
+    }
+
+    /// 等你停手，再在你的指针位置把假光标接回来，真指针同时藏起来，看上去就是同一个光标
+    private func waitForHandBack() {
+        let g = generation
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self, self.isRunning, self.generation == g else { return }
+            if self.isTakenOver { return self.waitForHandBack() }
+            self.showCursor(at: self.mouseLocation() ?? self.randomPoint())
+            NSCursor.setHiddenUntilMouseMoves(true)
+            self.schedule(after: 1.5)
+        }
+    }
+
+    private func schedule(after seconds: Double) {
+        let g = generation
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds * speed) { [weak self] in
+            guard let self, self.isRunning, self.generation == g else { return }
+            self.step()
+        }
+    }
+
+    private func step() {
+        let wv = webView()
+        if isTakenOver { return }   // waitForHandBack 会接着来
+        if wv.isLoading || wv.window == nil { return schedule(after: 1) }
+        if cursor.isHidden {
+            showCursor(at: mouseLocation() ?? randomPoint())
+            NSCursor.setHiddenUntilMouseMoves(true)
+        }
+        actionsSinceClick += 1
+        if Prefs.autoBrowseClicks, actionsSinceClick >= nextClickAfter {
+            return clickStep()
+        }
+        scrollStep()
+    }
+
+    // MARK: 滚动
+
+    private static let scrollJS = """
+    (function(dy){
+      function scroller(){
+        let el = document.elementFromPoint(innerWidth / 2, innerHeight / 2);
+        while (el && el !== document.body && el !== document.documentElement) {
+          const s = getComputedStyle(el);
+          if (/(auto|scroll)/.test(s.overflowY) && el.scrollHeight > el.clientHeight + 20) return el;
+          el = el.parentElement;
+        }
+        return document.scrollingElement || document.documentElement;
+      }
+      const el = scroller();
+      const max = el.scrollHeight - el.clientHeight;
+      if (dy === 0) { el.scrollTo({top: 0, behavior: 'smooth'}); return 'top'; }
+      if (dy > 0 && el.scrollTop >= max - 5) return 'bottom';
+      el.scrollBy({top: dy, behavior: 'smooth'});
+      return 'ok';
+    })(%d)
+    """
+
+    private func scrollStep() {
+        // 大多数时候往下看，偶尔往回翻一点，像在回头确认内容
+        let dy = Double.random(in: 0..<1) < 0.15 ? -Int.random(in: 120...260) : Int.random(in: 180...480)
+        let g = generation
+        moveCursor(to: randomPoint()) { [weak self] in
+            guard let self, self.isRunning, self.generation == g else { return }
+            self.webView().evaluateJavaScript(String(format: Self.scrollJS, dy)) { result, _ in
+                if result as? String == "bottom" {
+                    if Prefs.autoBrowseClicks {
+                        self.actionsSinceClick = self.nextClickAfter   // 看到底了，下一步就点链接
+                    } else {
+                        self.webView().evaluateJavaScript(String(format: Self.scrollJS, 0))
+                    }
+                }
+                self.schedule(after: Double.random(in: 2.5...6))
+            }
+        }
+    }
+
+    // MARK: 点击链接
+
+    /// 只挑当前网站内、看得见的普通链接；带“删除/退出/审批/支付”之类字样的一律跳过
+    private static let linksJS = """
+    (function(){
+      const bad = /(logout|log-out|signout|sign-out|sign_out|logoff|delete|remove|destroy|unsubscribe|approve|reject|decline|accept|confirm|submit|send|cancel|archive|purchase|checkout|order|pay|cart|download|admin|settings|\\.(pdf|zip|exe|dmg|pkg|msi)(\\?|$)|删除|退出|注销|登出|审批|批准|同意|拒绝|提交|发送|取消|购买|支付|下单|下载|设置)/i;
+      const out = [];
+      for (const a of document.querySelectorAll('a[href]')) {
+        if (a.hasAttribute('download') || a.target === '_blank') continue;
+        let u; try { u = new URL(a.href, location.href); } catch (e) { continue; }
+        if (!/^https?:$/.test(u.protocol) || u.host !== location.host) continue;
+        if (u.href.split('#')[0] === location.href.split('#')[0]) continue;
+        if (bad.test(u.href) || bad.test(a.textContent || '') || bad.test(a.getAttribute('aria-label') || '')) continue;
+        const r = a.getBoundingClientRect();
+        if (r.width < 8 || r.height < 8 || r.top < 30 || r.bottom > innerHeight - 20 || r.left < 0 || r.right > innerWidth) continue;
+        const st = getComputedStyle(a);
+        if (st.visibility === 'hidden' || st.display === 'none' || Number(st.opacity) === 0) continue;
+        out.push([u.href, r.left + r.width / 2, r.top + r.height / 2]);
+        if (out.length >= 150) break;
+      }
+      return out;
+    })()
+    """
+
+    private func clickStep() {
+        actionsSinceClick = 0
+        nextClickAfter = Int.random(in: 4...8)
+        let wv = webView()
+        let g = generation
+        // 离起点走得太远了，就用假光标去点“后退”
+        if hops >= 3, wv.canGoBack {
+            moveCursor(to: backButtonCenter()) { [weak self] in
+                guard let self, self.isRunning, self.generation == g else { return }
+                self.pressThen { self.goBack(); self.hops -= 1; self.schedule(after: 3) }
+            }
+            return
+        }
+        wv.evaluateJavaScript(Self.linksJS) { [weak self] result, _ in
+            guard let self, self.isRunning, self.generation == g else { return }
+            guard let links = result as? [[Any]], let pick = links.randomElement(),
+                  let href = pick[0] as? String, let url = URL(string: href),
+                  let x = (pick[1] as? NSNumber)?.doubleValue, let y = (pick[2] as? NSNumber)?.doubleValue
+            else { return self.scrollStep() }   // 这一屏没有合适的链接，接着滚
+            let scale = wv.pageZoom * wv.magnification
+            let p = NSPoint(x: wv.frame.minX + x * scale, y: wv.frame.minY + y * scale)
+            self.moveCursor(to: p, endAsHand: true) {
+                guard self.isRunning, self.generation == g, self.webView() === wv else { return }
+                self.pressThen {
+                    wv.load(URLRequest(url: url))
+                    self.hops += 1
+                    self.schedule(after: 3)
+                }
+            }
+        }
+    }
+
+    // MARK: 假光标动画
+
+    private func showCursor(at p: NSPoint) {
+        cursor.setHand(false)
+        cursor.setFrameOrigin(cursor.origin(forTip: p))
+        cursor.isHidden = false
+    }
+
+    private func randomPoint() -> NSPoint {
+        let f = webView().frame.insetBy(dx: 80, dy: 60)
+        guard f.width > 0, f.height > 0 else { return NSPoint(x: webView().frame.midX, y: webView().frame.midY) }
+        return NSPoint(x: .random(in: f.minX...f.maxX), y: .random(in: f.minY...f.maxY))
+    }
+
+    /// 先经过一个随机的中间点再到终点，走得像人手而不是一条直线
+    private func moveCursor(to target: NSPoint, endAsHand: Bool = false, completion: @escaping () -> Void) {
+        let start = cursor.tip
+        let mid = NSPoint(x: (start.x + target.x) / 2 + .random(in: -60...60),
+                          y: (start.y + target.y) / 2 + .random(in: -40...40))
+        let dist = hypot(target.x - start.x, target.y - start.y)
+        let total = min(1.4, max(0.35, Double(dist) / 700)) * speed
+        cursor.setHand(false)
+        animate(to: mid, duration: total * 0.45) { [weak self] in
+            guard let self else { return }
+            self.animate(to: target, duration: total * 0.55) {
+                if endAsHand { self.cursor.setHand(true); self.cursor.setFrameOrigin(self.cursor.origin(forTip: target)) }
+                completion()
+            }
+        }
+    }
+
+    private func animate(to p: NSPoint, duration: Double, completion: @escaping () -> Void) {
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = duration
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            cursor.animator().setFrameOrigin(cursor.origin(forTip: p))
+        }, completionHandler: completion)
+    }
+
+    /// 停顿一下再“按下去”，看起来像在确认要点的东西
+    private func pressThen(_ action: @escaping () -> Void) {
+        let g = generation
+        DispatchQueue.main.asyncAfter(deadline: .now() + .random(in: 0.3...0.7)) { [weak self] in
+            guard let self, self.isRunning, self.generation == g else { return }
+            action()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.cursor.setHand(false) }
+        }
+    }
+}
+
 // MARK: - 标签栏（Safari 的“分开式”布局：工具栏下面一排等宽标签）
 
 final class TabItem: NSView {
@@ -845,6 +1156,7 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
     private let webConfig: WKWebViewConfiguration
     private var tabObservations: [ObjectIdentifier: [NSKeyValueObservation]] = [:]
     private var closedTabs: [URL] = []
+    let autoBrowser = AutoBrowser()
     let prevZone = HotZone()
     let nextZone = HotZone()
     private var sidebarButton: NSButton!
@@ -940,6 +1252,19 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
         tabs = [webView]
         showCurrentTab()
         applyTextPrefs()
+
+        autoBrowser.cursor.isHidden = true
+        root.addSubview(autoBrowser.cursor)   // 最后加，保证在所有视图上面
+        autoBrowser.webView = { [unowned self] in self.webView }
+        autoBrowser.backButtonCenter = { [unowned self] in
+            self.bar.convert(NSPoint(x: self.backButton.frame.midX, y: self.backButton.frame.midY), to: self.root)
+        }
+        autoBrowser.goBack = { [weak self] in self?.webView.goBack() }
+        autoBrowser.mouseLocation = { [unowned self] in
+            guard let win = self.window else { return nil }
+            let p = self.root.convert(win.mouseLocationOutsideOfEventStream, from: nil)
+            return self.webView.frame.contains(p) ? p : nil
+        }
     }
 
     // MARK: 标签页
@@ -1069,6 +1394,15 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
             self.setBoss(true)
         }
 
+        NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown, .rightMouseDown, .scrollWheel]) { [weak self] e in
+            guard let self, self.autoBrowser.isRunning, e.window === self.window else { return e }
+            let p = self.root.convert(e.locationInWindow, from: nil)
+            let inCorner = (!self.prevZone.isHidden && self.prevZone.frame.contains(p)) || (!self.nextZone.isHidden && self.nextZone.frame.contains(p))
+            guard self.webView.frame.contains(p), !inCorner else { return e }
+            if e.type == .mouseMoved { self.autoBrowser.mouseMoved(to: p) } else { self.autoBrowser.mouseClickedOrScrolled() }
+            return e
+        }
+
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             guard let self, !ShortcutRecorder.isRecording, e.window === self.window else { return e }
             // 切换标签页：⌃⇥ / ⌃⇧⇥、⇧⌘] / ⇧⌘[、⌘1…⌘9（编辑地址栏时也能用）
@@ -1084,6 +1418,7 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
                 return nil
             }
             guard !self.box.isEditing else { return e }
+            if ShortcutAction.autoBrowse.shortcut?.matches(e) == true { self.toggleAutoBrowse(nil); return nil }
             if ShortcutAction.boss.shortcut?.matches(e) == true {
                 self.toggleBoss()
                 return nil   // 不能传给网页：WKWebView 会把没处理的按键再发回来，导致切换两次
@@ -1264,6 +1599,7 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
 
     private func moveTo(_ newOffset: Int, remember: Bool = true, direction: Int = 0) {
         guard let n = novel else { return }
+        if direction != 0 { autoBrowser.ignoreMouseBriefly() }
         if remember {
             history.append(offset)
             if history.count > 1000 { history.removeFirst() }
@@ -1329,6 +1665,18 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
     @objc func setFontSize(_ sender: NSMenuItem) { Prefs.fontSize = sender.tag; applyTextPrefs() }
     @objc func setTextStyle(_ sender: NSMenuItem) { Prefs.textStyle = sender.tag; applyTextPrefs() }
     @objc func toggleAutoHide(_ sender: Any?) { Prefs.autoHide.toggle() }
+
+    @objc func toggleAutoBrowse(_ sender: Any?) {
+        if autoBrowser.isRunning {
+            autoBrowser.stop()
+            window?.acceptsMouseMovedEvents = false
+        } else {
+            window?.acceptsMouseMovedEvents = true   // 用来发现你自己动了鼠标
+            autoBrowser.start()
+        }
+    }
+    @objc func toggleAutoBrowseClicks(_ sender: Any?) { Prefs.autoBrowseClicks.toggle() }
+    @objc func setAutoBrowseSpeed(_ sender: NSMenuItem) { Prefs.autoBrowseSpeed = sender.tag }
     @objc func setPageTransition(_ sender: NSMenuItem) { Prefs.pageTransition = sender.tag }
     @objc func setTransitionSpeed(_ sender: NSMenuItem) { Prefs.transitionSpeed = sender.tag }
     @objc func setMaxBoxWidth(_ sender: NSMenuItem) { Prefs.maxBoxWidth = sender.tag; history.removeAll(); root.needsLayout = true }
@@ -1391,6 +1739,11 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         switch item.action {
+        case #selector(toggleAutoBrowse(_:)):
+            item.state = autoBrowser.isRunning ? .on : .off
+            item.title = "自动浏览（\(ShortcutAction.autoBrowse.label)）"
+        case #selector(toggleAutoBrowseClicks(_:)): item.state = Prefs.autoBrowseClicks ? .on : .off
+        case #selector(setAutoBrowseSpeed(_:)): item.state = item.tag == Prefs.autoBrowseSpeed ? .on : .off
         case #selector(nextPageAction(_:)): item.title = "下一页（\(ShortcutAction.nextPage.label)）"
         case #selector(prevPageAction(_:)): item.title = "上一页（\(ShortcutAction.prevPage.label)）"
         case #selector(toggleBossAction(_:)):
@@ -1613,6 +1966,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         bm.addItem(.separator())
         add(bm, "老板模式", #selector(BrowserController.toggleBossAction(_:)), target: c)
         add(bm, "快捷键设置…", #selector(showShortcutSettings(_:)), target: self)
+        bm.addItem(.separator())
+        add(bm, "自动浏览", #selector(BrowserController.toggleAutoBrowse(_:)), target: c)
+        add(bm, "自动浏览时点击站内链接", #selector(BrowserController.toggleAutoBrowseClicks(_:)), target: c)
+        choices("自动浏览速度", [("慢", 1), ("适中", 2), ("快", 3)], #selector(BrowserController.setAutoBrowseSpeed(_:)))
         add(bm, "切到别的 App 时隐藏（按 Esc 恢复）", #selector(BrowserController.toggleAutoHide(_:)), target: c)
         bm.addItem(.separator())
 
