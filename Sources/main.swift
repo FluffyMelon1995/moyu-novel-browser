@@ -71,6 +71,15 @@ enum Prefs {
         get { d.string(forKey: "lastURL") }
         set { d.set(newValue, forKey: "lastURL") }
     }
+    /// 上次打开的所有标签页，下次启动时恢复
+    static var tabURLs: [String]? {
+        get { d.stringArray(forKey: "tabURLs") }
+        set { d.set(newValue, forKey: "tabURLs") }
+    }
+    static var selectedTab: Int {
+        get { d.integer(forKey: "selectedTab") }
+        set { d.set(newValue, forKey: "selectedTab") }
+    }
     static var novelPath: String? {
         get { d.string(forKey: "novelPath") }
         set { d.set(newValue, forKey: "novelPath") }
@@ -718,13 +727,124 @@ final class AddressBox: NSView, NSTextFieldDelegate {
 
 // MARK: - 浏览器窗口
 
+// MARK: - 标签栏（Safari 的“分开式”布局：工具栏下面一排等宽标签）
+
+final class TabItem: NSView {
+    var onSelect: (() -> Void)?
+    var onClose: (() -> Void)?
+    var isSelected = false { didSet { needsDisplay = true; updateClose() } }
+    private var hovering = false { didSet { needsDisplay = true; updateClose() } }
+    private let label = NSTextField(labelWithString: "")
+    private let closeButton = NSButton()
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        label.font = .systemFont(ofSize: 12)
+        label.alignment = .center
+        label.lineBreakMode = .byTruncatingTail
+        addSubview(label)
+        closeButton.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: "关闭标签页")?
+            .withSymbolConfiguration(.init(pointSize: 9, weight: .semibold))
+        closeButton.isBordered = false
+        closeButton.contentTintColor = .secondaryLabelColor
+        closeButton.target = self
+        closeButton.action = #selector(closeClicked)
+        closeButton.isHidden = true
+        addSubview(closeButton)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var isFlipped: Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    var title: String {
+        get { label.stringValue }
+        set { label.stringValue = newValue; toolTip = newValue }
+    }
+
+    private func updateClose() {
+        closeButton.isHidden = !hovering
+        label.textColor = isSelected ? .labelColor : .secondaryLabelColor
+    }
+
+    override func layout() {
+        super.layout()
+        closeButton.frame = NSRect(x: 6, y: (bounds.height - 16) / 2, width: 16, height: 16)
+        label.frame = NSRect(x: 26, y: (bounds.height - 16) / 2, width: max(0, bounds.width - 52), height: 16)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard isSelected || hovering else { return }
+        let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let color: NSColor = isSelected
+            ? (dark ? NSColor.white.withAlphaComponent(0.13) : NSColor.white.withAlphaComponent(0.85))
+            : (dark ? NSColor.white.withAlphaComponent(0.06) : NSColor.black.withAlphaComponent(0.04))
+        color.setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: 7, yRadius: 7).fill()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+
+    override func mouseEntered(with event: NSEvent) { hovering = true }
+    override func mouseExited(with event: NSEvent) { hovering = false }
+    override func mouseDown(with event: NSEvent) { onSelect?() }
+    override func otherMouseUp(with event: NSEvent) { if event.buttonNumber == 2 { onClose?() } }   // 中键关闭
+    @objc private func closeClicked() { onClose?() }
+}
+
+final class TabStrip: NSView {
+    var onSelect: ((Int) -> Void)?
+    var onClose: ((Int) -> Void)?
+    private var items: [TabItem] = []
+
+    override var isFlipped: Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    func reload(titles: [String], selected: Int) {
+        while items.count < titles.count {
+            let item = TabItem()
+            addSubview(item)
+            items.append(item)
+        }
+        while items.count > titles.count { items.removeLast().removeFromSuperview() }
+        for (i, item) in items.enumerated() {
+            item.title = titles[i]
+            item.isSelected = i == selected
+            item.onSelect = { [weak self] in self?.onSelect?(i) }
+            item.onClose = { [weak self] in self?.onClose?(i) }
+        }
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        let n = CGFloat(max(1, items.count)), gap: CGFloat = 4, pad: CGFloat = 10
+        let w = (bounds.width - pad * 2 - gap * (n - 1)) / n
+        for (i, item) in items.enumerated() {
+            item.frame = NSRect(x: pad + CGFloat(i) * (w + gap), y: 1, width: w, height: bounds.height - 6)
+        }
+    }
+}
+
 final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate,
     WKDownloadDelegate, NSMenuItemValidation {
     let root = RootView()
     let bar = TopBar()
     let separator = NSBox()
     let box = AddressBox()
-    let webView: WKWebView
+    let tabStrip = TabStrip()
+    /// 当前标签页的网页
+    private(set) var webView: WKWebView
+    private var tabs: [WKWebView] = []
+    private let webConfig: WKWebViewConfiguration
+    private var tabObservations: [ObjectIdentifier: [NSKeyValueObservation]] = [:]
+    private var closedTabs: [URL] = []
     let prevZone = HotZone()
     let nextZone = HotZone()
     private var sidebarButton: NSButton!
@@ -748,6 +868,7 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
         config.websiteDataStore = .default()
         config.applicationNameForUserAgent = "Version/18.0 Safari/605.1.15"
         config.preferences.isElementFullscreenEnabled = true
+        webConfig = config
         webView = WKWebView(frame: .zero, configuration: config)
 
         let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1280, height: 820),
@@ -783,23 +904,23 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
         bar.blendingMode = .withinWindow
         bar.state = .followsWindowActiveState
         separator.boxType = .separator
-        root.addSubview(webView)
         root.addSubview(bar)
         root.addSubview(separator)
         prevZone.symbol = "chevron.left"
         prevZone.onClick = { [weak self] in self?.prevPage() }
         nextZone.onClick = { [weak self] in self?.nextPage() }
-        for z in [prevZone, nextZone] {
-            z.scrollTarget = webView
-            root.addSubview(z)
-        }
+        for z in [prevZone, nextZone] { root.addSubview(z) }
+
+        bar.addSubview(tabStrip)
+        tabStrip.onSelect = { [weak self] i in self?.selectTab(i) }
+        tabStrip.onClose = { [weak self] i in self?.closeTab(i) }
 
         // 外观上和 Safari 一样；“边栏”= 跳转章节，“所有标签页”= 老板键
         sidebarButton = symbolButton("sidebar.left", #selector(jumpChapter(_:)), "显示边栏")
         backButton = symbolButton("chevron.left", #selector(goBack(_:)), "后退")
         forwardButton = symbolButton("chevron.right", #selector(goForward(_:)), "前进")
         shareButton = symbolButton("square.and.arrow.up", #selector(copyURL(_:)), "共享")
-        newTabButton = symbolButton("plus", #selector(goHome(_:)), "新建标签页")
+        newTabButton = symbolButton("plus", #selector(newTab(_:)), "新建标签页")
         bossButton = symbolButton("square.on.square", #selector(toggleBossAction(_:)), "显示所有标签页")
         for b in [sidebarButton!, backButton!, forwardButton!, shareButton!, newTabButton!, bossButton!] {
             bar.addSubview(b)
@@ -815,30 +936,129 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
             self.root.needsLayout = true
         }
 
-        webView.navigationDelegate = self
-        webView.uiDelegate = self
-        webView.allowsBackForwardNavigationGestures = true
-        webView.allowsMagnification = true
+        setUpTab(webView)
+        tabs = [webView]
+        showCurrentTab()
+        applyTextPrefs()
+    }
 
+    // MARK: 标签页
+
+    private var currentIndex: Int { tabs.firstIndex { $0 === webView } ?? 0 }
+
+    private func setUpTab(_ wv: WKWebView) {
+        wv.navigationDelegate = self
+        wv.uiDelegate = self
+        wv.allowsBackForwardNavigationGestures = true
+        wv.allowsMagnification = true
+        // 每个标签的标题和网址一变，就刷新标签栏、保存会话
+        tabObservations[ObjectIdentifier(wv)] = [
+            wv.observe(\.title) { [weak self] _, _ in self?.refreshTabs() },
+            wv.observe(\.url) { [weak self] _, _ in self?.refreshTabs(); self?.saveSession() },
+        ]
+    }
+
+    /// 把当前标签的网页放进窗口，并把地址栏、按钮绑定到它身上
+    private func showCurrentTab() {
+        for t in tabs where t !== webView { t.removeFromSuperview() }
+        if webView.superview == nil { root.addSubview(webView, positioned: .below, relativeTo: bar) }
+        prevZone.scrollTarget = webView
+        nextZone.scrollTarget = webView
         observations = [
-            webView.observe(\.url) { [weak self] _, _ in self?.urlChanged() },
-            webView.observe(\.title) { [weak self] wv, _ in self?.window?.title = wv.title ?? "" },
-            webView.observe(\.estimatedProgress) { [weak self] wv, _ in self?.box.progress = wv.estimatedProgress },
-            webView.observe(\.canGoBack) { [weak self] wv, _ in self?.backButton.isEnabled = wv.canGoBack },
-            webView.observe(\.canGoForward) { [weak self] wv, _ in self?.forwardButton.isEnabled = wv.canGoForward },
-            webView.observe(\.isLoading) { [weak self] wv, _ in
+            webView.observe(\.url, options: .initial) { [weak self] _, _ in self?.urlChanged() },
+            webView.observe(\.title, options: .initial) { [weak self] wv, _ in self?.window?.title = wv.title ?? "" },
+            webView.observe(\.estimatedProgress, options: .initial) { [weak self] wv, _ in self?.box.progress = wv.estimatedProgress },
+            webView.observe(\.canGoBack, options: .initial) { [weak self] wv, _ in self?.backButton.isEnabled = wv.canGoBack },
+            webView.observe(\.canGoForward, options: .initial) { [weak self] wv, _ in self?.forwardButton.isEnabled = wv.canGoForward },
+            webView.observe(\.isLoading, options: .initial) { [weak self] wv, _ in
                 self?.box.reloadButton.image = NSImage(systemSymbolName: wv.isLoading ? "xmark" : "arrow.clockwise",
                                                        accessibilityDescription: nil)?
                     .withSymbolConfiguration(.init(pointSize: 12, weight: .medium))
             },
         ]
-        backButton.isEnabled = false
-        forwardButton.isEnabled = false
-        applyTextPrefs()
+        refreshTabs()
+        root.needsLayout = true
+    }
+
+    private func refreshTabs() {
+        let titles = tabs.map { t -> String in
+            if let title = t.title, !title.isEmpty { return title }
+            return t.url?.host ?? "新标签页"
+        }
+        let wasVisible = !tabStrip.isHidden
+        tabStrip.isHidden = tabs.count < 2   // 和 Safari 一样，只有一个标签时不显示标签栏
+        tabStrip.reload(titles: titles, selected: currentIndex)
+        if wasVisible != !tabStrip.isHidden { root.needsLayout = true }
+    }
+
+    /// 新标签默认插在当前标签右边
+    @discardableResult
+    private func addTab(_ wv: WKWebView? = nil, select: Bool = true, at index: Int? = nil) -> WKWebView {
+        let tab = wv ?? WKWebView(frame: .zero, configuration: webConfig)
+        setUpTab(tab)
+        let i = min(index ?? currentIndex + 1, tabs.count)
+        tabs.insert(tab, at: i)
+        if select { selectTab(i) } else { refreshTabs() }
+        saveSession()
+        return tab
+    }
+
+    func selectTab(_ i: Int) {
+        guard tabs.indices.contains(i) else { return }
+        if box.isEditing { box.endEditing() }
+        webView = tabs[i]
+        showCurrentTab()
+        window?.makeFirstResponder(webView)
+        saveSession()
+    }
+
+    func closeTab(_ i: Int) {
+        guard tabs.indices.contains(i) else { return }
+        if tabs.count == 1 { window?.performClose(nil); return }
+        let tab = tabs.remove(at: i)
+        if let u = tab.url { closedTabs.append(u) }
+        tabObservations[ObjectIdentifier(tab)] = nil
+        tab.stopLoading()
+        tab.removeFromSuperview()
+        if tab === webView { webView = tabs[min(i, tabs.count - 1)] }
+        showCurrentTab()
+        window?.makeFirstResponder(webView)
+        saveSession()
+    }
+
+    private func saveSession() {
+        Prefs.tabURLs = tabs.map { $0.url?.absoluteString ?? "" }
+        Prefs.selectedTab = currentIndex
+    }
+
+    private func restoreSession() {
+        let urls = Prefs.tabURLs?.filter { !$0.isEmpty } ?? []
+        guard !urls.isEmpty else { return open(Prefs.lastURL ?? Prefs.homeURL) }
+        open(urls[0])
+        for u in urls.dropFirst() {
+            if let url = URL(string: u) { addTab(select: false, at: tabs.count).load(URLRequest(url: url)) }
+        }
+        selectTab(min(max(0, Prefs.selectedTab), tabs.count - 1))
+    }
+
+    @objc func newTab(_ sender: Any?) {
+        addTab()
+        open(Prefs.homeURL)
+        box.beginEditing()   // 像 Safari 一样，新标签页直接可以输入网址
+    }
+
+    @objc func closeCurrentTab(_ sender: Any?) { closeTab(currentIndex) }
+    @objc func closeWindow(_ sender: Any?) { window?.performClose(nil) }
+    @objc func nextTab(_ sender: Any?) { selectTab((currentIndex + 1) % tabs.count) }
+    @objc func previousTab(_ sender: Any?) { selectTab((currentIndex - 1 + tabs.count) % tabs.count) }
+
+    @objc func reopenClosedTab(_ sender: Any?) {
+        guard let u = closedTabs.popLast() else { return NSSound.beep() }
+        addTab().load(URLRequest(url: u))
     }
 
     func start() {
-        open(Prefs.lastURL ?? Prefs.homeURL)
+        restoreSession()
         if let path = Prefs.novelPath { loadNovel(path) }
         restartFlipTimer()
         render()
@@ -850,7 +1070,20 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
         }
 
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
-            guard let self, !ShortcutRecorder.isRecording, e.window === self.window, !self.box.isEditing else { return e }
+            guard let self, !ShortcutRecorder.isRecording, e.window === self.window else { return e }
+            // 切换标签页：⌃⇥ / ⌃⇧⇥、⇧⌘] / ⇧⌘[、⌘1…⌘9（编辑地址栏时也能用）
+            let tabFlags = e.modifierFlags.intersection(Shortcut.modMask)
+            let code = Int(e.keyCode)
+            if code == kVK_Tab, tabFlags == .control { self.nextTab(nil); return nil }
+            if code == kVK_Tab, tabFlags == [.control, .shift] { self.previousTab(nil); return nil }
+            if code == kVK_ANSI_RightBracket, tabFlags == [.command, .shift] { self.nextTab(nil); return nil }
+            if code == kVK_ANSI_LeftBracket, tabFlags == [.command, .shift] { self.previousTab(nil); return nil }
+            let digits = [kVK_ANSI_1, kVK_ANSI_2, kVK_ANSI_3, kVK_ANSI_4, kVK_ANSI_5, kVK_ANSI_6, kVK_ANSI_7, kVK_ANSI_8, kVK_ANSI_9]
+            if tabFlags == .command, let n = digits.firstIndex(of: code) {
+                self.selectTab(n == 8 ? self.tabs.count - 1 : n)   // ⌘9 = 最后一个标签
+                return nil
+            }
+            guard !self.box.isEditing else { return e }
             if ShortcutAction.boss.shortcut?.matches(e) == true {
                 self.toggleBoss()
                 return nil   // 不能传给网页：WKWebView 会把没处理的按键再发回来，导致切换两次
@@ -878,8 +1111,11 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
         guard let win = window else { return }
         let W = root.bounds.width, H = root.bounds.height
         let boxH = max(30, CGFloat(box.displayLines) * box.lineHeight + 14)
-        let barH = max(52, boxH + 22)
+        let toolbarH = max(52, boxH + 22)
+        let tabsH: CGFloat = tabStrip.isHidden ? 0 : 32
+        let barH = toolbarH + tabsH
         bar.frame = NSRect(x: 0, y: 0, width: W, height: barH)
+        tabStrip.frame = NSRect(x: 0, y: toolbarH, width: W, height: tabsH)
         separator.frame = NSRect(x: 0, y: barH, width: W, height: 1)
         webView.frame = NSRect(x: 0, y: barH + 1, width: W, height: max(0, H - barH - 1))
 
@@ -1211,9 +1447,9 @@ final class BrowserController: NSWindowController, NSWindowDelegate, WKNavigatio
 
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for action: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        // target=_blank 的链接在当前页打开
-        if action.targetFrame == nil { webView.load(action.request) }
-        return nil
+        // target=_blank 和 window.open 都在新标签页打开（必须用 WebKit 给的 configuration 创建）
+        guard action.targetFrame == nil else { return nil }
+        return addTab(WKWebView(frame: .zero, configuration: configuration))
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
@@ -1337,10 +1573,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         add(app, "Quit \(name)", #selector(NSApplication.terminate(_:)), "q")
 
         let file = submenu("File")
+        add(file, "New Tab", #selector(BrowserController.newTab(_:)), "t", target: c)
         add(file, "Open Location…", #selector(BrowserController.focusAddress(_:)), "l", target: c)
         add(file, "Open File…", #selector(BrowserController.openNovel(_:)), "o", target: c)
         file.addItem(.separator())
-        add(file, "Close Window", #selector(NSWindow.performClose(_:)), "w")
+        add(file, "Close Tab", #selector(BrowserController.closeCurrentTab(_:)), "w", target: c)
+        add(file, "Close Window", #selector(BrowserController.closeWindow(_:)), "w", [.command, .shift], target: c)
+        add(file, "Reopen Closed Tab", #selector(BrowserController.reopenClosedTab(_:)), "t", [.command, .shift], target: c)
 
         let edit = submenu("Edit")
         add(edit, "Undo", Selector(("undo:")), "z")
@@ -1402,6 +1641,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let win = submenu("Window")
         add(win, "Minimize", #selector(NSWindow.performMiniaturize(_:)), "m")
         add(win, "Zoom", #selector(NSWindow.performZoom(_:)))
+        win.addItem(.separator())
+        // 真正的切换在按键监听里处理（⌃⇥ 会被网页吃掉），这里只是显示快捷键
+        add(win, "Show Previous Tab", #selector(BrowserController.previousTab(_:)), "\t", [.control, .shift], target: c)
+        add(win, "Show Next Tab", #selector(BrowserController.nextTab(_:)), "\t", .control, target: c)
         NSApp.windowsMenu = win
 
         return main
